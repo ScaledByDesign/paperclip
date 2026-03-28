@@ -30,6 +30,7 @@ services:
       BETTER_AUTH_URL: "${PAPERCLIP_PUBLIC_URL:-http://206.189.225.63:3100}"
       PAPERCLIP_SECRETS_PROVIDER: "local_encrypted"
       PAPERCLIP_ALLOWED_HOSTNAMES: "206.189.225.63,localhost,paperclip.delegate.ws"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY}"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
