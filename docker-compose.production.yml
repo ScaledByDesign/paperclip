@@ -25,11 +25,11 @@ services:
       SERVE_UI: "true"
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated"
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public"
-      PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://137.184.218.113:3100}"
+      PAPERCLIP_PUBLIC_URL: "${PAPERCLIP_PUBLIC_URL:-http://206.189.225.63:3100}"
       BETTER_AUTH_SECRET: "${BETTER_AUTH_SECRET}"
-      BETTER_AUTH_URL: "${PAPERCLIP_PUBLIC_URL:-http://137.184.218.113:3100}"
+      BETTER_AUTH_URL: "${PAPERCLIP_PUBLIC_URL:-http://206.189.225.63:3100}"
       PAPERCLIP_SECRETS_PROVIDER: "local_encrypted"
-      PAPERCLIP_ALLOWED_HOSTNAMES: "137.184.218.113,localhost,paperclip.delegate.ws"
+      PAPERCLIP_ALLOWED_HOSTNAMES: "206.189.225.63,localhost,paperclip.delegate.ws"
     volumes:
       - paperclip-data:/paperclip
     depends_on:
