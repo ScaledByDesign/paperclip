@@ -22,6 +22,7 @@ import {
   resolveWorkspaceHandoffLocalKey,
   resolveWorkspaceHandoffLocalWorkspaceId,
 } from "./workspace-login-handoff.js";
+import { buildOidcAuthOptions, loadOidcAuthConfig } from "./oidc.js";
 
 export type BetterAuthSessionUser = {
   id: string;
@@ -257,6 +258,27 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
     publicUrl,
   });
 
+  const oidcConfig = loadOidcAuthConfig();
+  const oidc = oidcConfig ? buildOidcAuthOptions(oidcConfig, { disableSignUp: config.authDisableSignUp }) : null;
+  const handoffPlugins = resolveWorkspaceHandoffIdentity(config)
+    ? [
+        workspaceLoginHandoffPlugin({
+          db,
+          // Re-resolved per exchange so a hot restart cannot keep validating
+          // against an origin the control plane has since republished.
+          resolveExpectedIdentity: () =>
+            resolveWorkspaceHandoffIdentity(config) ?? {
+              key: null,
+              instanceId: null,
+              executionWorkspaceId: null,
+              companyId: null,
+              origin: null,
+            },
+        }),
+      ]
+    : [];
+  const plugins = [...handoffPlugins, ...(oidc?.plugins ?? [])];
+
   const authConfig = {
     baseURL: baseUrl,
     secret,
@@ -281,26 +303,16 @@ export function createBetterAuthInstance(db: Db, config: Config, trustedOrigins:
       override: process.env.PAPERCLIP_AUTH_RATE_LIMIT_ENABLED,
     }),
     advanced: buildBetterAuthAdvancedOptions({ disableSecureCookies }),
-    // Registered only for a managed workspace instance: the plugin is what makes
-    // `Open workspace` password-independent, and a control-plane instance that
-    // was never handed a workspace key must not expose the exchange at all.
-    ...(resolveWorkspaceHandoffIdentity(config)
+    // The handoff plugin is registered only for a managed workspace instance:
+    // it is what makes `Open workspace` password-independent, and a
+    // control-plane instance that was never handed a workspace key must not
+    // expose the exchange at all. OIDC adds its plugins only when configured.
+    ...(plugins.length > 0 ? { plugins } : {}),
+    // OIDC-only options; absent (not merely empty) when OIDC is off.
+    ...(oidc
       ? {
-          plugins: [
-            workspaceLoginHandoffPlugin({
-              db,
-              // Re-resolved per exchange so a hot restart cannot keep validating
-              // against an origin the control plane has since republished.
-              resolveExpectedIdentity: () =>
-                resolveWorkspaceHandoffIdentity(config) ?? {
-                  key: null,
-                  instanceId: null,
-                  executionWorkspaceId: null,
-                  companyId: null,
-                  origin: null,
-                },
-            }),
-          ],
+          user: { validateUserInfo: oidc.validateUserInfo },
+          account: { accountLinking: oidc.accountLinking },
         }
       : {}),
   };

@@ -1,10 +1,16 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "@/lib/router";
 import { authApi } from "../api/auth";
 import { healthApi } from "../api/health";
 import { CloudSignIn } from "@/components/CloudSignIn";
 import { clearCloudSignInAttempt } from "@/lib/cloud-sign-in";
+import {
+  LOCAL_SIGN_IN_PARAM,
+  describeOidcError,
+  oidcErrorReturnPath,
+  redirectToIdentityProvider,
+} from "@/lib/oidc-sign-in";
 import { tenantSignInReturnPath } from "@/lib/cloudLinks";
 import { queryKeys } from "../lib/queryKeys";
 import { getRememberedInvitePath } from "../lib/invite-memory";
@@ -41,6 +47,41 @@ export function AuthPage() {
     queryFn: () => authApi.getSession(),
     retry: false,
   });
+  // OIDC is a self-hosted option; Cloud tenants have their own sign-in. A
+  // failed lookup falls back to the password form rather than blocking it.
+  const oidcQuery = useQuery({
+    queryKey: queryKeys.auth.oidcConfig,
+    queryFn: () => authApi.getOidcConfig().catch(() => null),
+    retry: false,
+    enabled: Boolean(healthQuery.data) && !healthQuery.data?.cloud,
+  });
+  const oidc = oidcQuery.data ?? null;
+  // `?local=1` is the break-glass: no automatic redirect, password form shown.
+  const localSignIn = searchParams.get(LOCAL_SIGN_IN_PARAM) === "1";
+  const oidcErrorCode = searchParams.get("error");
+  const oidcMutation = useMutation({
+    mutationFn: async () => {
+      if (!oidc) throw new Error("Single sign-on is not configured");
+      return authApi.beginOidcSignIn({
+        providerId: oidc.providerId,
+        callbackURL: nextPath,
+        errorCallbackURL: oidcErrorReturnPath(nextPath),
+      });
+    },
+    onSuccess: (url) => redirectToIdentityProvider(url),
+    onError: (err) => {
+      setError(err instanceof Error ? err.message : "Single sign-on failed");
+    },
+  });
+  const shouldAutoRedirect = Boolean(
+    oidc?.autoRedirect && !localSignIn && !oidcErrorCode && !session && !sessionError && !isSessionLoading,
+  );
+  const autoRedirectStarted = useRef(false);
+  useEffect(() => {
+    if (!shouldAutoRedirect || autoRedirectStarted.current) return;
+    autoRedirectStarted.current = true;
+    oidcMutation.mutate();
+  }, [shouldAutoRedirect, oidcMutation]);
 
   useEffect(() => {
     if (session) {
@@ -82,7 +123,13 @@ export function AuthPage() {
     password.trim().length > 0 &&
     (mode === "sign_in" || (name.trim().length > 0 && password.trim().length >= 8));
 
-  if (healthQuery.isLoading || isSessionLoading || session) {
+  if (
+    healthQuery.isLoading ||
+    isSessionLoading ||
+    session ||
+    oidcQuery.isLoading ||
+    (shouldAutoRedirect && !oidcMutation.isError)
+  ) {
     return (
       <div className="fixed inset-0 flex items-center justify-center">
         <PaperclipLoading className="min-h-0" />
@@ -119,6 +166,30 @@ export function AuthPage() {
               ? "Use your email and password to access this instance."
               : "Create an account for this instance. Email confirmation is not required in v1."}
           </p>
+
+          {oidc && oidcErrorCode && (
+            <p role="alert" className="mt-4 text-xs text-destructive">
+              {describeOidcError(oidcErrorCode)}
+            </p>
+          )}
+
+          {oidc && mode === "sign_in" && (
+            <div className="mt-6 space-y-4">
+              <Button
+                type="button"
+                variant="outline"
+                className="w-full"
+                disabled={oidcMutation.isPending}
+                onClick={() => {
+                  setError(null);
+                  oidcMutation.mutate();
+                }}
+              >
+                {oidcMutation.isPending ? "Redirecting…" : `Sign in with ${oidc.displayName}`}
+              </Button>
+              <p className="text-center text-xs text-muted-foreground">or use your email and password</p>
+            </div>
+          )}
 
           <form
             className="mt-6 space-y-4"

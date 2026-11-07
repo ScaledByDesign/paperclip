@@ -590,6 +590,7 @@ export const queryKeys = {
   },
   auth: {
     session: ["auth", "session"] as const,
+    oidcConfig: ["auth", "oidc-config"] as const,
   },
   inboxAgentPolicy: {
     mine: (companyId: string) =>

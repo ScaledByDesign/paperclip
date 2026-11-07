@@ -151,7 +151,55 @@ async function authPatch<T>(path: string, body: Record<string, unknown>, parse: 
   return parse(payload);
 }
 
+/** Present only when the server has OIDC sign-in configured. */
+export interface OidcSignInConfig {
+  providerId: string;
+  displayName: string;
+  autoRedirect: boolean;
+}
+
+function parseOidcSignInConfig(value: unknown): OidcSignInConfig | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.providerId !== "string" || typeof record.displayName !== "string") return null;
+  return {
+    providerId: record.providerId,
+    displayName: record.displayName,
+    autoRedirect: record.autoRedirect === true,
+  };
+}
+
 export const authApi = {
+  /** Null when OIDC is off: the server does not register the endpoint at all. */
+  getOidcConfig: async (): Promise<OidcSignInConfig | null> => {
+    const res = await fetch("/api/auth/oidc/config", {
+      credentials: "include",
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (res.status === 404) return null;
+    const payload = await res.json().catch(() => null);
+    if (!res.ok) throw extractAuthError(payload as AuthErrorBody, res.status);
+    return parseOidcSignInConfig(payload);
+  },
+
+  /**
+   * Starts the OIDC authorization-code flow and returns the IdP URL to visit.
+   * Both return targets must be same-origin relative paths; the server refuses
+   * anything else.
+   */
+  beginOidcSignIn: async (input: { providerId: string; callbackURL: string; errorCallbackURL: string }): Promise<string> => {
+    const payload = await authPost("/sign-in/social", {
+      provider: input.providerId,
+      callbackURL: input.callbackURL,
+      errorCallbackURL: input.errorCallbackURL,
+      disableRedirect: true,
+    });
+    const url = payload && typeof payload === "object" ? (payload as Record<string, unknown>).url : null;
+    if (typeof url !== "string" || !url) throw new Error("Sign-in provider did not return a URL");
+    return url;
+  },
+
   getSession: async (): Promise<AuthSession | null> => {
     const res = await fetch("/api/auth/get-session", {
       credentials: "include",

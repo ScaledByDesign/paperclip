@@ -16,6 +16,9 @@ const signInEmailMock = vi.hoisted(() => vi.fn());
 const signUpEmailMock = vi.hoisted(() => vi.fn());
 const healthMock = vi.hoisted(() => vi.fn());
 const beginCloudSignInMock = vi.hoisted(() => vi.fn());
+const getOidcConfigMock = vi.hoisted(() => vi.fn());
+const beginOidcSignInMock = vi.hoisted(() => vi.fn());
+const redirectToIdentityProviderMock = vi.hoisted(() => vi.fn());
 
 vi.mock("../api/health", () => ({ healthApi: { get: () => healthMock() } }));
 vi.mock("@/lib/cloud-sign-in", () => ({
@@ -23,8 +26,15 @@ vi.mock("@/lib/cloud-sign-in", () => ({
   clearCloudSignInAttempt: vi.fn(),
 }));
 
+vi.mock("@/lib/oidc-sign-in", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/oidc-sign-in")>()),
+  redirectToIdentityProvider: (url: string) => redirectToIdentityProviderMock(url),
+}));
+
 vi.mock("../api/auth", () => ({
   authApi: {
+    getOidcConfig: () => getOidcConfigMock(),
+    beginOidcSignIn: (input: unknown) => beginOidcSignInMock(input),
     getSession: () => getSessionMock(),
     signInEmail: (input: unknown) => signInEmailMock(input),
     signUpEmail: (input: unknown) => signUpEmailMock(input),
@@ -101,6 +111,8 @@ describe("AuthPage", () => {
     beginCloudSignInMock.mockReturnValue(true);
     signInEmailMock.mockResolvedValue(undefined);
     signUpEmailMock.mockResolvedValue(undefined);
+    getOidcConfigMock.mockResolvedValue(null);
+    beginOidcSignInMock.mockResolvedValue("https://sso.example.com/authorize?state=abc");
   });
 
   afterEach(() => {
@@ -137,6 +149,76 @@ describe("AuthPage", () => {
     expect(target.searchParams.get("returnTo")).toBe("/TEST/issues/TEST-1?tab=activity#comment");
     expect(container.querySelector("form")).toBeNull();
     await act(() => root.unmount());
+  });
+
+  describe("OIDC sign-in", () => {
+    const keycloak = { providerId: "oidc", displayName: "Keycloak", autoRedirect: false };
+    const ssoButton = () =>
+      Array.from(container.querySelectorAll("button")).find((button) => button.textContent?.includes("Sign in with"));
+
+    it("shows no SSO button when OIDC is not configured", async () => {
+      const { root } = await mount();
+      expect(container.querySelector("form")).not.toBeNull();
+      expect(ssoButton()).toBeUndefined();
+      expect(redirectToIdentityProviderMock).not.toHaveBeenCalled();
+      await act(() => root.unmount());
+    });
+
+    it("starts the flow from the button with same-origin return paths", async () => {
+      getOidcConfigMock.mockResolvedValue(keycloak);
+      const { root } = await mount("/auth?next=%2FTEST%2Fissues");
+      await vi.waitFor(() => expect(ssoButton()?.textContent).toBe("Sign in with Keycloak"));
+      expect(container.querySelector("form")).not.toBeNull();
+      await act(async () => ssoButton()!.click());
+      await vi.waitFor(() => expect(redirectToIdentityProviderMock).toHaveBeenCalledWith("https://sso.example.com/authorize?state=abc"));
+      expect(beginOidcSignInMock).toHaveBeenCalledWith({
+        providerId: "oidc",
+        callbackURL: "/TEST/issues",
+        errorCallbackURL: "/auth?local=1&next=%2FTEST%2Fissues",
+      });
+      await act(() => root.unmount());
+    });
+
+    it("redirects straight to the IdP when auto-redirect is on", async () => {
+      getOidcConfigMock.mockResolvedValue({ ...keycloak, autoRedirect: true });
+      const { root } = await mount();
+      await vi.waitFor(() => expect(redirectToIdentityProviderMock).toHaveBeenCalledTimes(1));
+      expect(container.querySelector("form")).toBeNull();
+      await act(() => root.unmount());
+    });
+
+    it("lets ?local=1 bypass the auto-redirect", async () => {
+      getOidcConfigMock.mockResolvedValue({ ...keycloak, autoRedirect: true });
+      const { root } = await mount("/auth?local=1");
+      await vi.waitFor(() => expect(container.querySelector("form")).not.toBeNull());
+      expect(ssoButton()).toBeDefined();
+      expect(beginOidcSignInMock).not.toHaveBeenCalled();
+      expect(redirectToIdentityProviderMock).not.toHaveBeenCalled();
+      await act(() => root.unmount());
+    });
+
+    it("ignores ?error= when OIDC is off and never echoes unknown codes", async () => {
+      const off = await mount("/auth?error=Call%20+1-555-scam");
+      await vi.waitFor(() => expect(container.querySelector("form")).not.toBeNull());
+      expect(container.textContent).not.toContain("scam");
+      expect(container.textContent).not.toContain("Single sign-on");
+      await act(() => off.root.unmount());
+
+      getOidcConfigMock.mockResolvedValue(keycloak);
+      const on = await mount("/auth?error=Call%20+1-555-scam");
+      await vi.waitFor(() => expect(container.textContent).toContain("Single sign-on failed"));
+      expect(container.textContent).not.toContain("scam");
+      await act(() => on.root.unmount());
+    });
+
+    it("does not loop after a failed SSO sign-in and explains why", async () => {
+      getOidcConfigMock.mockResolvedValue({ ...keycloak, autoRedirect: true });
+      const { root } = await mount("/auth?error=oidc_group_not_allowed");
+      await vi.waitFor(() => expect(container.textContent).toContain("not in a group allowed"));
+      expect(container.querySelector("form")).not.toBeNull();
+      expect(redirectToIdentityProviderMock).not.toHaveBeenCalled();
+      await act(() => root.unmount());
+    });
   });
 
   it("never flashes a form while deployment metadata is loading", async () => {

@@ -1,0 +1,143 @@
+# Gitea Actions: the CI authority for the ScaledByDesign fork (GitHub Actions is not a gate).
+# Targeted lane for what the fork changes on top of upstream (OIDC sign-in):
+# typecheck of server and ui, and the auth suites, against a real embedded Postgres.
+# Upstream's full suite stays upstream's job.
+name: verify
+
+on:
+  push:
+    branches: ["sbd/**"]
+    tags: ["v*-sbd.*"]
+  pull_request:
+
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  auth:
+    runs-on: hyper-ci
+    container:
+      image: node:24-bookworm
+    timeout-minutes: 45
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Embedded Postgres refuses to run as root, and a skipped Postgres suite would
+      # be a silent pass, so everything runs as the image's unprivileged node user.
+      - name: Install
+        run: |
+          set -euo pipefail
+          chown -R node:node "$GITHUB_WORKSPACE"
+          su node -s /bin/bash -c "export npm_config_cache=/home/node/.npm && cd '$GITHUB_WORKSPACE' && npx -y pnpm@9.15.4 install --frozen-lockfile"
+
+      - name: Typecheck server and ui
+        run: |
+          set -euo pipefail
+          # The server's own `typecheck` script also builds the Runner binary (needs cargo);
+          # type checking needs only the TypeScript outputs of the workspace packages.
+          su node -s /bin/bash -c "export npm_config_cache=/home/node/.npm && cd '$GITHUB_WORKSPACE' \
+            && npx -y pnpm@9.15.4 --filter @paperclipai/paperclip-runner run build:typescript \
+            && npx -y pnpm@9.15.4 --filter @paperclipai/plugin-sdk ensure-build-deps \
+            && npx -y pnpm@9.15.4 --filter @paperclipai/server exec tsc --noEmit \
+            && npx -y pnpm@9.15.4 --filter @paperclipai/ui run typecheck"
+
+      - name: Auth tests (fail if zero ran or any skipped)
+        run: |
+          set -euo pipefail
+          su node -s /bin/bash -c "export npm_config_cache=/home/node/.npm && cd '$GITHUB_WORKSPACE/server' && npx -y pnpm@9.15.4 exec vitest run \
+            src/__tests__/auth-oidc.test.ts \
+            src/__tests__/better-auth-oidc.integration.test.ts \
+            src/__tests__/better-auth-credential-signup.integration.test.ts \
+            src/__tests__/better-auth.test.ts \
+            src/__tests__/auth-routes.test.ts \
+            --reporter=default --reporter=junit --outputFile.junit=$GITHUB_WORKSPACE/server-junit.xml"
+          su node -s /bin/bash -c "export npm_config_cache=/home/node/.npm && cd '$GITHUB_WORKSPACE/ui' && npx -y pnpm@9.15.4 exec vitest run \
+            src/pages/Auth.test.tsx src/api/auth.test.ts \
+            --reporter=default --reporter=junit --outputFile.junit=$GITHUB_WORKSPACE/ui-junit.xml"
+          python3 - <<'PY'
+          import sys, xml.etree.ElementTree as ET
+          bad = False
+          for name in ("server-junit.xml", "ui-junit.xml"):
+              root = ET.parse(name).getroot()
+              total = int(root.get("tests", 0)); failed = int(root.get("failures", 0)) + int(root.get("errors", 0))
+              skipped = sum(1 for _ in root.iter("skipped"))
+              print(f"{name}: {total} tests, {failed} failed/errored, {skipped} skipped")
+              bad |= total < 10 or failed > 0 or skipped > 0
+          sys.exit(1 if bad else 0)
+          PY
+
+  # The production image, built for amd64 like oversight-host, must boot with every
+  # PAPERCLIP_AUTH_OIDC_* variable empty (what docker-compose passes on an unconfigured
+  # host). It must answer /api/health with "status":"ok" (the auto-deploy health check)
+  # and serve today's email/password sign-in, with no OIDC route.
+  image:
+    runs-on: hyper-ci
+    container:
+      image: node:24-bookworm
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker CLI
+        run: |
+          set -euo pipefail
+          curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.3.1.tgz | tar xz -C /tmp
+          install -m 0755 /tmp/docker/docker /usr/local/bin/docker
+          # The Dockerfile needs BuildKit (COPY --parents); the static CLI ships without buildx.
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSLo "$HOME/.docker/cli-plugins/docker-buildx" https://github.com/docker/buildx/releases/download/v0.17.1/buildx-v0.17.1.linux-amd64
+          chmod 0755 "$HOME/.docker/cli-plugins/docker-buildx"
+          docker buildx version
+          docker version --format 'client {{.Client.Version}} server {{.Server.Version}}'
+
+      - name: Build production image
+        run: DOCKER_BUILDKIT=1 docker buildx build --load --target production -t "paperclip-sbd-ci:${GITHUB_SHA}" .
+
+      - name: Boot with OIDC off and smoke-test sign-in
+        shell: bash
+        run: |
+          set -euo pipefail
+          id="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"; port=$((32000 + GITHUB_RUN_ID % 20000))
+          echo "id=$id" >> "$GITHUB_ENV"
+          origin="http://127.0.0.1:${port}"
+          docker network create "$id"
+          docker run -d --name "$id-db" --network "$id" -e POSTGRES_USER=paperclip -e POSTGRES_PASSWORD=ci -e POSTGRES_DB=paperclip postgres:17-alpine
+          for _ in $(seq 1 30); do docker exec "$id-db" pg_isready -U paperclip >/dev/null 2>&1 && break; sleep 2; done
+          docker run -d --name "$id-app" --network "$id" -p "127.0.0.1:${port}:3100" \
+            -e DATABASE_URL=postgres://paperclip:ci@$id-db:5432/paperclip -e PORT=3100 -e SERVE_UI=true \
+            -e PAPERCLIP_DEPLOYMENT_MODE=authenticated -e PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
+            -e PAPERCLIP_PUBLIC_URL="$origin" -e BETTER_AUTH_SECRET=ci-better-auth-secret-0123456789abcdef \
+            -e PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=ci-signing-secret-0123456789abcdef -e DO_NOT_TRACK=1 \
+            -e PAPERCLIP_AUTH_DISABLE_SIGN_UP= -e PAPERCLIP_AUTH_OIDC_ISSUER= -e PAPERCLIP_AUTH_OIDC_CLIENT_ID= \
+            -e PAPERCLIP_AUTH_OIDC_CLIENT_SECRET= -e PAPERCLIP_AUTH_OIDC_PROVIDER_NAME= -e PAPERCLIP_AUTH_OIDC_ALLOWED_GROUPS= \
+            -e PAPERCLIP_AUTH_OIDC_AUTO_REDIRECT= -e PAPERCLIP_AUTH_OIDC_SCOPES= \
+            "paperclip-sbd-ci:${GITHUB_SHA}"
+          trap 'rc=$?; if [ $rc -ne 0 ]; then echo "--- last response bodies"; cat /tmp/signup.json /tmp/signin.json 2>/dev/null; echo; echo "--- app log"; docker logs --tail 80 "$id-app" 2>&1; fi' EXIT
+          ok=""
+          for _ in $(seq 1 60); do
+            if curl -fsS -m 5 "$origin/api/health" 2>/dev/null | grep -q '"status":"ok"'; then ok=1; break; fi
+            sleep 5
+          done
+          [ -n "$ok" ] || { echo "health never ok"; docker logs --tail 200 "$id-app"; exit 1; }
+          echo "health ok"
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$origin/api/auth/oidc/config"); echo "oidc/config -> $code"; [ "$code" = 404 ]
+          code=$(curl -s -o /dev/null -w '%{http_code}' "$origin/auth"); echo "/auth -> $code"; [ "$code" = 200 ]
+          body='{"email":"ci@example.com","password":"correct-horse-battery-staple","name":"CI"}'
+          code=$(curl -s -o /tmp/signup.json -w '%{http_code}' -H 'content-type: application/json' -H "origin: $origin" -d "$body" "$origin/api/auth/sign-up/email"); echo "sign-up -> $code"; [ "$code" = 200 ]
+          code=$(curl -s -o /tmp/signin.json -D /tmp/signin.headers -w '%{http_code}' -H 'content-type: application/json' -H "origin: $origin" \
+            -d '{"email":"ci@example.com","password":"correct-horse-battery-staple"}' "$origin/api/auth/sign-in/email"); echo "sign-in -> $code"; [ "$code" = 200 ]
+          grep -qi '^set-cookie:.*session_token=' /tmp/signin.headers && echo "session cookie set"
+          if docker logs "$id-app" 2>&1 | grep -qi 'oidc'; then echo "unexpected OIDC log line with OIDC off"; docker logs "$id-app" 2>&1 | grep -i oidc; exit 1; fi
+
+      - name: Clean up
+        if: always()
+        run: |
+          [ -n "${id:-}" ] || exit 0
+          docker rm -f "$id-app" "$id-db" >/dev/null 2>&1 || true
+          docker network rm "$id" >/dev/null 2>&1 || true
+          docker image rm "paperclip-sbd-ci:${GITHUB_SHA}" >/dev/null 2>&1 || true
