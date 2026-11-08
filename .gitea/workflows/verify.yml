@@ -111,7 +111,7 @@ jobs:
           docker run -d --name "$id-app" --network "$id" -p "127.0.0.1:${port}:3100" \
             -e DATABASE_URL=postgres://paperclip:ci@$id-db:5432/paperclip -e PORT=3100 -e SERVE_UI=true \
             -e PAPERCLIP_DEPLOYMENT_MODE=authenticated -e PAPERCLIP_DEPLOYMENT_EXPOSURE=private \
-            -e PAPERCLIP_PUBLIC_URL="$origin" -e BETTER_AUTH_SECRET=ci-better-auth-secret-0123456789abcdef \
+            -e PAPERCLIP_PUBLIC_URL="$origin" -e BETTER_AUTH_TRUSTED_ORIGINS="$origin" -e BETTER_AUTH_SECRET=ci-better-auth-secret-0123456789abcdef \
             -e PAPERCLIP_TOOL_ACTION_SIGNING_SECRET=ci-signing-secret-0123456789abcdef -e DO_NOT_TRACK=1 \
             -e PAPERCLIP_AUTH_DISABLE_SIGN_UP= -e PAPERCLIP_AUTH_OIDC_ISSUER= -e PAPERCLIP_AUTH_OIDC_CLIENT_ID= \
             -e PAPERCLIP_AUTH_OIDC_CLIENT_SECRET= -e PAPERCLIP_AUTH_OIDC_PROVIDER_NAME= -e PAPERCLIP_AUTH_OIDC_ALLOWED_GROUPS= \
@@ -125,6 +125,7 @@ jobs:
           done
           [ -n "$ok" ] || { echo "health never ok"; docker logs --tail 200 "$id-app"; exit 1; }
           echo "health ok"
+          docker logs "$id-app" 2>&1 | grep -m1 "auth origin configuration" | cut -c1-400 || true
           code=$(curl -s -o /dev/null -w '%{http_code}' "$origin/api/auth/oidc/config"); echo "oidc/config -> $code"; [ "$code" = 404 ]
           code=$(curl -s -o /dev/null -w '%{http_code}' "$origin/auth"); echo "/auth -> $code"; [ "$code" = 200 ]
           body='{"email":"ci@example.com","password":"correct-horse-battery-staple","name":"CI"}'
